@@ -1,5 +1,18 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
-venv/
+ride_bot.db
 *.db
+*.sqlite3
+.DS_Store
+venv/
+.vscode/
+.idea/
+# קבצים ותיקיות שלא יעלו ל-Git
+
+
+
+צריך להעלות פה טוקן מהטלגרם 
+ולראות בדיוק איפה להדביק אותו

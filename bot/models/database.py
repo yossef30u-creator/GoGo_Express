@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker, relationship
 import datetime
 import os
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot/models/ride_bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot/models/GoGo.db")
 
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -37,12 +37,20 @@ class User(Base):
     license_expiry = Column(Date, nullable=True)
     insurance_expiry = Column(Date, nullable=True)
     
-    # ניטור התראות
+    # ניטור התראות ודירוג
     last_expiry_notification = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    rating_sum = Column(Float, default=0.0) # סך כל הכוכבים שקיבל
-    rating_count = Column(Integer, default=0) # כמות הלקוחות שדירגו אותו
+    
+    # מערכת דירוג משופרת
+    rating_sum = Column(Float, default=0.0)    # סך הכוכבים
+    rating_count = Column(Integer, default=0)  # מספר מדרגים
+    rating_avg = Column(Float, default=0.0)    # הציון הסופי (לשליפה מהירה)
 
+    # מיקום אחרון של הנהג (לפי מה שביקשת)
+    last_lat = Column(Float, nullable=True)
+    last_lng = Column(Float, nullable=True)
+    last_seen = Column(DateTime, nullable=True)
+    
 class Job(Base):
     __tablename__ = "jobs"
     id = Column(Integer, primary_key=True, index=True)

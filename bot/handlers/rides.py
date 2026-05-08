@@ -3,9 +3,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from bot.models.database import SessionLocal, Job, User  # הוספנו את User כדי למשוך נהגים
 from aiogram.utils.keyboard import InlineKeyboardBuilder # תוספת לבניית מקלדת דינמית לנהג
-
-# === תוספת: ייבוא מילון המחוזות ממסך הנהג ===
 from bot.handlers.driver_actions import REGIONS_MAP
+from geopy.geocoders import Nominatim
+import time
+from geopy.distance import geodesic
 
 # === תוספת: מנוע התאמת המיקום החכם ===
 def is_driver_relevant(driver_work_region: str, pickup_address: str) -> bool:
@@ -50,17 +51,52 @@ def is_driver_relevant_single(single_region: str, pickup_address: str) -> bool:
     return single_region in pickup_address
 # ============================================
 
-# חילוץ חכם של שם המחוז/עיר הכללי מתוך טקסט הכתובת של הלקוח לשמירה בדאטה-בייס
+# יצירת אובייקט המפות (מחוץ לפונקציה כדי לחסוך זמן טעינה)
+geolocator = Nominatim(user_agent="GoGo_Express_Bot")
+
 def extract_region_from_address(address: str) -> str:
+    """הופך כתובת טקסטואלית לאזור גיאוגרפי מוגדר"""
+    
+    # 1. בדיקה מהירה: האם המשתמש כתב מילה שאנחנו כבר מכירים?
     for region_name, cities in REGIONS_MAP.items():
         if region_name in address:
             return region_name
         for city in cities:
             if city in address:
                 return city
+
+    # 2. חיפוש חכם במפה (אם לא מצאנו ברשימה הידנית)
+    try:
+        # מוסיפים ", ישראל" כדי שהחיפוש יהיה ממוקד
+        query = f"{address}, ישראל"
+        location = geolocator.geocode(query, addressdetails=True, timeout=10)
+
+        if location and 'address' in location.raw:
+            addr = location.raw['address']
+            
+            # שליפת המחוז מהמפה (state / city / town)
+            # המפה מחזירה שמות כמו "South District" או "מחוז הדרום"
+            state_info = addr.get('state', '') + addr.get('city', '') + addr.get('town', '')
+            
+            # מיפוי השמות של המפה לאזורים של הבוט שלנו
+            if any(word in state_info for word in ["South", "דרום", "באר שבע", "נגב"]):
+                return "דרום"
+            if any(word in state_info for word in ["North", "צפון", "חיפה", "גליל"]):
+                return "צפון"
+            if any(word in state_info for word in ["Center", "מרכז", "תל אביב", "Tel Aviv"]):
+                return "מרכז"
+            if any(word in state_info for word in ["Jerusalem", "ירושלים"]):
+                return "ירושלים"
+            
+            # אם מדובר בעיר ספציפית שהמפה מצאה
+            return addr.get('city') or addr.get('town') or addr.get('village') or "כללי"
+
+    except Exception as e:
+        print(f"⚠️ שגיאת מפה: {e}")
+    
     return "כללי"
 
-router = Router()
+#================================
 
 class RideFlow(StatesGroup):
     waiting_for_pickup = State()
@@ -241,23 +277,35 @@ async def pub_ride(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     db = SessionLocal()
     
-    # חילוץ האזור כדי לשמור אותו ב-DB
+    # --- תיקון: חילוץ GPS גם מכתובת טקסטואלית ---
+    p_lat = data.get('pickup_lat')
+    p_lng = data.get('pickup_lng')
+    
+    if not p_lat: # אם המשתמש הקליד ידנית ולא שלח GPS
+        try:
+            loc = geolocator.geocode(f"{data['pickup']}, ישראל", timeout=10)
+            if loc:
+                p_lat, p_lng = loc.latitude, loc.longitude
+        except:
+            pass
+    # --------------------------------------------
+
     detected_region = extract_region_from_address(data['pickup'])
 
     new_job = Job(
-        client_id=callback.from_user.id, # נוסף כדי לשייך את העבודה ללקוח!
+        client_id=callback.from_user.id,
         type="ride", 
         status="open", 
         pickup_loc=data['pickup'], 
-        pickup_lat=data.get('pickup_lat'), # שומר קואורדינטות ב-DB אם יש
-        pickup_lng=data.get('pickup_lng'), # שומר קואורדינטות ב-DB אם יש
+        pickup_lat=p_lat, # עכשיו יש לנו מספרים!
+        pickup_lng=p_lng, # עכשיו יש לנו מספרים!
         dropoff_loc=data['dropoff'],
-        weight=data['weight'], # זה בעצם שומר את מספר הנוסעים
+        weight=data['weight'],
         pickup_time=data['full_pickup_time'], 
-        deadline=None, # ריק, כי אין חלון מסירה בנסיעה
         price=data['price'],
         notes=data.get('notes', ""),
-        region=detected_region # נשמר ל-DB
+        region=detected_region
+    )
     )
     db.add(new_job)
     db.commit()
@@ -316,23 +364,32 @@ async def broadcast_ride(bot_instance, job_obj: Job):
     # ------------------------------------------------
 
     for driver in active_drivers:
-        # כאן הפונקציה בודקת האם הנהג רלוונטי לכתובת האיסוף
-        if is_driver_relevant(driver.work_regions, job_obj.pickup_loc):
-            try:
-                await bot_instance.send_message(
-                    chat_id=driver.telegram_id,
-                    text=driver_msg,
-                    reply_markup=driver_kb,
-                    parse_mode="Markdown"
-                )
-                
-                # תוספת בונוס: אם הלקוח שלח GPS, נשלח לנהג את זה גם כמפה קטנה בטלגרם להמחשה ויזואלית!
-                if job_obj.pickup_lat and job_obj.pickup_lng:
-                    await bot_instance.send_location(
-                        chat_id=driver.telegram_id,
-                        latitude=job_obj.pickup_lat,
-                        longitude=job_obj.pickup_lng
-                    )
-            except Exception as e:
-                print(f"Failed to send job {job_obj.id} to driver {driver.telegram_id}: {e}")
-    db.close()
+    should_notify = False
+
+    # תנאי 1: האם זה באזור העבודה הקבוע שלו?
+    if is_driver_relevant(driver.work_regions, job_obj.pickup_loc):
+        should_notify = True
+
+    # תנאי 2: בדיקת GPS (רק אם הנהג הפעיל רדיוס ויש נתוני מיקום)
+    # נניח ששמרנו לנהג שדה שנקרא pref_radius (למשל 10 ק"מ)
+    if not should_notify and driver.last_lat and driver.last_lng and job_obj.pickup_lat:
+        distance = geodesic(
+            (job_obj.pickup_lat, job_obj.pickup_lng),
+            (driver.last_lat, driver.last_lng)
+        ).km
+        
+        # אם הנהג הגדיר רדיוס (למשל 20 ק"מ) והוא בטווח
+        if driver.pref_radius and distance <= driver.pref_radius:
+            should_notify = True
+
+    # אם אחד התנאים עבד - שולחים!
+    if should_notify:
+        try:
+            await bot_instance.send_message(
+                chat_id=driver.telegram_id,
+                text=f"🔔 {driver_msg}", # נוסיף פעמון שיידע שזה התראה
+                reply_markup=driver_kb,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Error: {e}")
