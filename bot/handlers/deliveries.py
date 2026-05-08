@@ -5,6 +5,40 @@ from bot.models.database import SessionLocal, Job
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.models.database import User
 
+# === תוספת: ייבוא מילון המחוזות ממסך הנהג ===
+from bot.handlers.driver_actions import REGIONS_MAP
+
+# === תוספת: מנוע התאמת המיקום החכם ===
+def is_driver_relevant(driver_work_regions: str, job_region: str, pickup_address: str) -> bool:
+    if not driver_work_regions:
+        return False
+        
+    # מפצל את הערים שנבחרו לפי פסיק
+    chosen_regions = [r.strip() for r in driver_work_regions.split(",")]
+    
+    for driver_region in chosen_regions:
+        if driver_region.startswith("CITY:"):
+            city = driver_region.replace("CITY:", "")
+            if city in pickup_address:
+                return True
+                
+        elif driver_region.startswith("ALL:"):
+            region = driver_region.replace("ALL:", "")
+            if region == job_region:
+                return True
+            # בודק גם בתוך כתובת הלקוח למקרה של חוסר התאמה במחוז
+            region_cities = REGIONS_MAP.get(region, [])
+            for city in region_cities:
+                if city in pickup_address:
+                    return True
+                    
+        else: # תאימות למשתמשים ישנים ב-DB
+            if driver_region == job_region:
+                return True
+                
+    return False
+# ============================================
+
 router = Router()
 
 class DeliveryFlow(StatesGroup):
@@ -22,6 +56,23 @@ class DeliveryFlow(StatesGroup):
 
 @router.message(F.text == "📦 שליחת חבילה")
 async def start_delivery(message: types.Message, state: FSMContext):
+    
+    # === תוספת: חסימת ספאם (הגבלת מקסימום 3 הזמנות פעילות ללקוח) ===
+    db = SessionLocal()
+    active_jobs_count = db.query(Job).filter(
+        Job.client_id == message.from_user.id,
+        Job.status.in_(["open", "assigned", "pending_decision"])
+    ).count()
+    db.close()
+
+    if active_jobs_count >= 3:
+        await message.answer(
+            "❌ **הגעת למכסת ההזמנות הפעילות.**\n"
+            "לא ניתן לפתוח יותר מ-3 הזמנות במקביל. תוכל לסיים או לבטל הזמנות קיימות תחת '📋 ההזמנות שלי'."
+        )
+        return
+    # ==============================================================
+
     # הוספת מקלדת בחירת אזור
     kb = types.ReplyKeyboardMarkup(keyboard=[
         [types.KeyboardButton(text="מרכז"), types.KeyboardButton(text="דרום")],
@@ -36,18 +87,40 @@ async def start_delivery(message: types.Message, state: FSMContext):
 async def region_delivery(message: types.Message, state: FSMContext):
     await state.update_data(region=message.text)
     
+    # --- תוספת: כפתור בקשת מיקום GPS ---
+    kb = types.ReplyKeyboardMarkup(keyboard=[
+        [types.KeyboardButton(text="📍 שלח מיקום נוכחי", request_location=True)],
+        [types.KeyboardButton(text="🏠 הקלד כתובת ידנית")]
+    ], resize_keyboard=True, one_time_keyboard=True)
+    
     await message.answer(
         "📦 **מאיפה אוספים את החבילה?**\n\n"
-        "⚠️ *הוראה:* חובה להזין **כתובת מלאה** כדי שהשליח ימצא אותך בקלות.\n"
+        "באפשרותך ללחוץ על הכפתור למטה כדי לשלוח מיקום מדויק (GPS), או להקליד כתובת ידנית.\n"
         "*(לדוגמה: בני ברק, רחוב רמבם 10)*", 
-        reply_markup=types.ReplyKeyboardRemove(),
+        reply_markup=kb,
         parse_mode="Markdown"
     )
     await state.set_state(DeliveryFlow.waiting_for_pickup)
 
 @router.message(DeliveryFlow.waiting_for_pickup)
 async def pickup_delivery(message: types.Message, state: FSMContext):
-    await state.update_data(pickup=message.text)
+    # --- תוספת: טיפול בקבלת מיקום GPS לעומת טקסט ---
+    if message.location:
+        lat = message.location.latitude
+        lng = message.location.longitude
+        await state.update_data(pickup="מיקום GPS (צמוד למפה)", pickup_lat=lat, pickup_lng=lng)
+        await message.answer("📍 המיקום נקלט בהצלחה!", reply_markup=types.ReplyKeyboardRemove())
+    else:
+        # המשתמש הקליד טקסט (או לחץ על הכפתור "הקלד כתובת ידנית")
+        pickup_text = message.text
+        if pickup_text == "🏠 הקלד כתובת ידנית":
+            await message.answer("אנא הקלד את הכתובת המלאה כעת:", reply_markup=types.ReplyKeyboardRemove())
+            return # נחכה להודעה הבאה שלו שהיא הטקסט עצמו
+            
+        await state.update_data(pickup=pickup_text, pickup_lat=None, pickup_lng=None)
+        await message.answer("📍 הכתובת נקלטה בהצלחה!", reply_markup=types.ReplyKeyboardRemove())
+    # ---------------------------------------------
+
     await message.answer(
         "🏁 **לאן למסור את החבילה?**\n\n"
         "⚠️ *הוראה:* חובה להזין **כתובת מלאה** ליעד.\n"
@@ -193,12 +266,14 @@ async def pub_delivery(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     db = SessionLocal()
     
-    # נוסף האזור (region) לשמירה ב-DB
+    # נוסף האזור (region) וקואורדינטות ה-GPS לשמירה ב-DB
     new_job = Job(
         type="delivery", 
         status="open", 
         region=data['region'],
         pickup_loc=data['pickup'], 
+        pickup_lat=data.get('pickup_lat'), # שומר קואורדינטות ב-DB אם יש
+        pickup_lng=data.get('pickup_lng'), # שומר קואורדינטות ב-DB אם יש
         dropoff_loc=data['dropoff'],
         weight=data['weight'],
         pickup_time=data['full_pickup_time'], 
@@ -211,39 +286,72 @@ async def pub_delivery(callback: types.CallbackQuery, state: FSMContext):
     db.commit()
     db.refresh(new_job)
 
-    # סינון נהגים לפי אזור המשלוח הספציפי
-    drivers = db.query(User).filter(
-        User.role == "driver",
-        User.is_verified == True,
-        User.is_available == True,
-        User.work_regions == new_job.region
-    ).all()
-
-    for driver in drivers:
-        builder = InlineKeyboardBuilder()
-        builder.row(types.InlineKeyboardButton(text=f"✅ מקבל ב-{new_job.price} ₪", callback_data=f"accept_job_{new_job.id}"))
-        builder.row(types.InlineKeyboardButton(text="💰 הצעה נגדית", callback_data=f"counter_job_{new_job.id}"))
-        builder.row(types.InlineKeyboardButton(text="❌ התעלם", callback_data=f"ignore_job_{new_job.id}"))
-        
-        try:
-            await callback.bot.send_message(
-                driver.telegram_id,
-                f"🔔 **עבודת משלוח חדשה!** 🔔\n\n"
-                f"🌍 אזור: {new_job.region}\n"
-                f"📍 מ: {new_job.pickup_loc}\n"
-                f"🏁 ל: {new_job.dropoff_loc}\n"
-                f"📦 משקל/גודל: {new_job.weight}\n"
-                f"💰 מחיר מוצע: {new_job.price} ₪\n"
-                f"📝 הערות: {new_job.notes}",
-                reply_markup=builder.as_markup(),
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass 
+    # הפעלת פונקציית ההפצה המופרדת
+    await broadcast_delivery(callback.bot, new_job)
 
     await callback.message.edit_text(
         f"✅ **משלוח #{new_job.id} פורסם בהצלחה!**\nהועבר לשליחים באזור {new_job.region}. תקבל התראה כשנהג יגיש הצעה.", 
         parse_mode="Markdown"
     )
     db.close()
+    
+    # מחזיר לתפריט הראשי של הלקוח
+    from bot.main import get_keyboard
+    user = SessionLocal().query(User).filter(User.telegram_id == callback.from_user.id).first()
+    markup = get_keyboard(user)
+    await callback.message.answer("הזמנתך נמצאת בטיפול.", reply_markup=markup)
+    
     await state.clear()
+
+
+# =====================================================================
+# פונקציה ציבורית (Public Function) להפצת המשלוח לשליחים
+# (הופרד לפונקציה כדי שקבצים אחרים כמו scheduler וביטולים יוכלו לקרוא לו)
+# =====================================================================
+async def broadcast_delivery(bot_instance, job_obj: Job):
+    db = SessionLocal()
+    active_drivers = db.query(User).filter(
+        User.role == "driver",
+        User.driver_type.in_(["delivery", "both"]), # מוודא שרק שליחים או "גם וגם" יקבלו
+        User.is_available == True,
+        User.is_verified == True
+    ).all()
+
+    for driver in active_drivers:
+        # כאן מופעל המנוע החכם שבנינו כדי לוודא ששליח מקבל רק עבודות באזור שלו
+        if is_driver_relevant(driver.work_regions, job_obj.region, job_obj.pickup_loc):
+            
+            # --- תוספת: יצירת מקלדת חכמה עם Waze אם יש GPS ---
+            builder = InlineKeyboardBuilder()
+            if job_obj.pickup_lat and job_obj.pickup_lng:
+                waze_url = f"https://waze.com/ul?ll={job_obj.pickup_lat},{job_obj.pickup_lng}&navigate=yes"
+                builder.row(types.InlineKeyboardButton(text="📍 נווט ב-Waze לאיסוף", url=waze_url))
+                
+            builder.row(types.InlineKeyboardButton(text=f"✅ מקבל ב-{job_obj.price} ₪", callback_data=f"accept_job_{job_obj.id}"))
+            builder.row(types.InlineKeyboardButton(text="💰 הצעה נגדית", callback_data=f"counter_job_{job_obj.id}"))
+            builder.row(types.InlineKeyboardButton(text="❌ התעלם", callback_data=f"ignore_job_{job_obj.id}"))
+            
+            try:
+                await bot_instance.send_message(
+                    driver.telegram_id,
+                    f"🔔 **עבודת משלוח חדשה!** 🔔\n\n"
+                    f"🌍 אזור: {job_obj.region}\n"
+                    f"📍 מ: {job_obj.pickup_loc}\n"
+                    f"🏁 ל: {job_obj.dropoff_loc}\n"
+                    f"📦 משקל/גודל: {job_obj.weight}\n"
+                    f"💰 מחיר מוצע: {job_obj.price} ₪\n"
+                    f"📝 הערות: {job_obj.notes}",
+                    reply_markup=builder.as_markup(),
+                    parse_mode="Markdown"
+                )
+                
+                # תוספת בונוס: שליחת ה-GPS במפה קטנה לשליח אם נשלח על ידי הלקוח
+                if job_obj.pickup_lat and job_obj.pickup_lng:
+                    await bot_instance.send_location(
+                        chat_id=driver.telegram_id,
+                        latitude=job_obj.pickup_lat,
+                        longitude=job_obj.pickup_lng
+                    )
+            except Exception:
+                pass 
+    db.close()

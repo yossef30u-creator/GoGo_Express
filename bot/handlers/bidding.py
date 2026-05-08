@@ -1,7 +1,8 @@
 from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from bot.models.database import SessionLocal, Job, Bid
+# תוקן: הוספנו את User לייבוא כדי למשוך את נתוני הדירוג
+from bot.models.database import SessionLocal, Job, Bid, User 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 router = Router()
@@ -9,8 +10,19 @@ router = Router()
 class BidFlow(StatesGroup):
     waiting_for_counter_offer = State()
 
-# פונקציית עזר: שולחת את ההצעה ללקוח
+# פונקציית עזר: שולחת את ההצעה ללקוח בתוספת הדירוג של הנהג
 async def notify_client_about_bid(bot, job, bid):
+    # --- תוספת: שליפת דירוג הנהג ממסד הנתונים ---
+    db = SessionLocal()
+    driver = db.query(User).filter(User.telegram_id == bid.driver_id).first()
+    
+    rating_text = "⭐ דירוג: **חדש במערכת**"
+    if driver and driver.rating_count and driver.rating_count > 0:
+        avg_rating = driver.rating_sum / driver.rating_count
+        rating_text = f"⭐ דירוג: **{avg_rating:.1f}** ({driver.rating_count} דירוגים)"
+    db.close()
+    # --------------------------------------------
+
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="✅ קבל הצעה", callback_data=f"client_accept_bid_{bid.id}"))
     builder.row(types.InlineKeyboardButton(text="❌ דחה הצעה", callback_data=f"client_reject_bid_{bid.id}"))
@@ -20,6 +32,7 @@ async def notify_client_about_bid(bot, job, bid):
             chat_id=job.client_id,
             text=f"🔔 **הצעה חדשה לעבודה שלך!**\n\n"
                  f"הנהג/שליח **{bid.driver_name}** מציע לקחת את העבודה.\n"
+                 f"{rating_text}\n" # הצגת הדירוג ללקוח
                  f"💰 מחיר מוצע: **{bid.price} ₪**\n\n"
                  f"האם תרצה לאשר אותו?",
             reply_markup=builder.as_markup()
@@ -126,6 +139,7 @@ async def client_accept_bid(callback: types.CallbackQuery):
 
     # עדכון סטטוסים במסד הנתונים
     job.status = "assigned" # העבודה סגורה ומשויכת
+    job.driver_id = bid.driver_id # שמירת הנהג הנבחר בעבודה
     bid.status = "accepted"
     db.commit()
     

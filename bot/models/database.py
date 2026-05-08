@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Date, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import datetime
@@ -40,14 +40,29 @@ class User(Base):
     # ניטור התראות
     last_expiry_notification = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    rating_sum = Column(Float, default=0.0) # סך כל הכוכבים שקיבל
+    rating_count = Column(Integer, default=0) # כמות הלקוחות שדירגו אותו
 
 class Job(Base):
     __tablename__ = "jobs"
     id = Column(Integer, primary_key=True, index=True)
     client_id = Column(Integer, nullable=True)
+    
+    # === תוספת: שדה לשמירת הנהג שניצח במכרז ולקח את העבודה ===
+    driver_id = Column(Integer, nullable=True) 
+    # ==========================================================
+    
     type = Column(String)  # ride / delivery
     status = Column(String, default="open")
     pickup_loc = Column(String)
+    
+    # --- תוספת למיקום חי (GPS) ---
+    pickup_lat = Column(Float, nullable=True) # קו רוחב איסוף
+    pickup_lng = Column(Float, nullable=True) # קו אורך איסוף
+    dropoff_lat = Column(Float, nullable=True) # קו רוחב יעד (אופציונלי)
+    dropoff_lng = Column(Float, nullable=True) # קו אורך יעד (אופציונלי)
+    # -----------------------------
+    
     dropoff_loc = Column(String)
     weight = Column(String, nullable=True)
     pickup_time = Column(String, nullable=True)
@@ -55,8 +70,9 @@ class Job(Base):
     price = Column(String, nullable=True)
     notes = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    bids = relationship("Bid", back_populates
-    ="job", cascade="all, delete-orphan")
+    
+    # תוקן: שבירת השורה שהייתה בקוד המקורי
+    bids = relationship("Bid", back_populates="job", cascade="all, delete-orphan")
     
     region = Column(String, nullable=True) # האזור שבו העבודה מתבצעת (מרכז/דרום/וכו')
 
@@ -71,6 +87,39 @@ class Bid(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     job = relationship("Job", back_populates="bids")
 
+# ==========================================================
+# תוספת: טבלת ארכיון לנסיעות ומשלוחים היסטוריים
+# ==========================================================
+class JobHistory(Base):
+    """טבלת ארכיון לנסיעות ומשלוחים שהסתיימו או בוטלו"""
+    __tablename__ = "jobs_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    original_id = Column(Integer) # ה-ID המקורי מטבלת jobs
+    client_id = Column(Integer, nullable=True)
+    driver_id = Column(Integer, nullable=True)
+    type = Column(String)  # ride / delivery
+    status = Column(String) # completed / cancelled
+    pickup_loc = Column(String)
+    
+    # --- תוספת למיקום חי (GPS) בארכיון ---
+    pickup_lat = Column(Float, nullable=True)
+    pickup_lng = Column(Float, nullable=True)
+    dropoff_lat = Column(Float, nullable=True)
+    dropoff_lng = Column(Float, nullable=True)
+    # -------------------------------------
+    
+    dropoff_loc = Column(String)
+    weight = Column(String, nullable=True)
+    pickup_time = Column(String, nullable=True)
+    deadline = Column(String, nullable=True)
+    price = Column(String, nullable=True)
+    notes = Column(String, nullable=True)
+    region = Column(String, nullable=True)
+    
+    created_at = Column(DateTime) # מתי הנסיעה נפתחה במקור
+    archived_at = Column(DateTime, default=datetime.datetime.utcnow) # מתי היא עברה לארכיון
+
 def init_db():
     Base.metadata.create_all(bind=engine)
-    print("✅ Database updated with document management fields.")
+    print("✅ Database updated with document management fields and History table.")

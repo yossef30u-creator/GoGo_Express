@@ -3,13 +3,14 @@ import logging
 import os
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
-from bot.handlers import deliveries, rides, bidding, driver_reg, admin_panel, driver_actions
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext  # חשוב לאיפוס מצבים
 from bot.models.database import SessionLocal, User, init_db
 
-# ייבוא ה-Handlers בצורה מסודרת
-from bot.handlers import deliveries, rides, bidding, driver_reg, admin_panel
+# === תוספת: ייבוא הסקדיולר וקובץ הדשבורד החדש ===
+from bot.utils.scheduler import start_scheduler
+from bot.handlers import deliveries, rides, bidding, driver_reg, admin_panel, driver_actions, client_actions, driver_management, driver_dashboard
+# ===============================================
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -23,6 +24,9 @@ dp.include_router(rides.router)
 dp.include_router(driver_actions.router)
 dp.include_router(driver_reg.router)   # שאלון הרישום החדש
 dp.include_router(admin_panel.router)  # לוח האישורים של המנהל
+dp.include_router(client_actions.router)     # מסך ההזמנות שלי (לקוח)
+dp.include_router(driver_management.router)  # מסך ניהול עבודות ישן (אם ישארו שם פונקציות)
+dp.include_router(driver_dashboard.router)   # --- תוספת: מסך הניהול החדש והרווחים ---
 dp.include_router(bidding.router)      # מנוע המכרז (בסוף כי הוא מטפל ב-callbacks)
 
 def get_keyboard(user: User):
@@ -33,16 +37,25 @@ def get_keyboard(user: User):
         # תפריט לקוח
         kb.append([types.KeyboardButton(text="🚖 הזמנת נסיעה"), types.KeyboardButton(text="📦 שליחת חבילה")])
         
-        # כפתור מעבר/רישום (כאן ה-if/else פנימי וזה מצוין)
+        # כפתור ניהול ההזמנות של הלקוח
+        kb.append([types.KeyboardButton(text="📋 ההזמנות שלי")])
+        
+        # כפתור מעבר/רישום
         if user.role == "driver":
             kb.append([types.KeyboardButton(text="🔄 עבור למסך נהג")])
         else:
             kb.append([types.KeyboardButton(text="🆔 הרשמה כנהג/שליח")])
             
-    elif user.current_mode == "driver": # <--- שים לב: ה-elif עכשיו בקו של ה-if הראשון
-        # תפריט נהג - התיקון: מציג את הפעולה, לא את המצב הנוכחי
+    elif user.current_mode == "driver": 
+        # תפריט נהג 
         status_btn = "🔴 התנתק (כרגע מחובר)" if user.is_available else "🟢 התחבר (כרגע מנותק)"
         kb.append([types.KeyboardButton(text=status_btn)])
+        
+        # --- תוספת: כפתורי הדשבורד החדשים (מחליף את הפיצול הישן) ---
+        kb.append([types.KeyboardButton(text="📅 העבודות שלי (פעיל)")])
+        kb.append([types.KeyboardButton(text="📊 דשבורד ורווחים")])
+        # -------------------------------------------------------
+        
         kb.append([types.KeyboardButton(text="📍 שנה אזור עבודה")])
         kb.append([types.KeyboardButton(text="🔄 עבור למסך לקוח")])
         
@@ -67,13 +80,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
         db.commit()
         db.refresh(user)
     
+    # הבדיקה החדשה: אם הוא נהג ומצב העבודה שלו הוא נהג - הצג לו את הדשבורד
     markup = get_keyboard(user)
+    
+    welcome_text = f"שלום {message.from_user.first_name}! 👋\n"
+    if user.role == "driver" and user.current_mode == "driver":
+        welcome_text += "חזרת למסך הנהג. העבודות שלך מחכות לך למטה! 👇"
+    else:
+        welcome_text += "ברוך הבא למערכת.\nמה ברצונך לעשות?"
+
     db.close()
     
-    await message.answer(
-        f"שלום {message.from_user.first_name}! 👋\nברוך הבא למערכת.\nמה ברצונך לעשות?", 
-        reply_markup=markup
-    )
+    await message.answer(welcome_text, reply_markup=markup)
 
 @dp.message(F.text == "🔄 עבור למסך נהג")
 async def switch_to_driver(message: types.Message):
@@ -106,7 +124,8 @@ async def switch_to_client(message: types.Message):
     
     db.close()
 
-@dp.message(F.text.in_(["🟢 מחובר - קבל התראות", "🔴 מנותק - השתק"]))
+# --- תוספת קטנה של באג פיקס: התאמנו את הטקסטים שהבוט מחפש לטקסטים שרשומים על הכפתור! ---
+@dp.message(F.text.in_(["🟢 התחבר (כרגע מנותק)", "🔴 התנתק (כרגע מחובר)"]))
 async def toggle_driver_availability(message: types.Message):
     db = SessionLocal()
     user = db.query(User).filter(User.telegram_id == message.from_user.id).first()
@@ -123,6 +142,10 @@ async def toggle_driver_availability(message: types.Message):
 async def main():
     # יצירת טבלאות
     init_db()
+    
+    # --- תוספת: הפעלת משימות הרקע (הסקדיולר) ---
+    start_scheduler(bot)
+    # ---------------------------------------
     
     # ניקוי עדכונים קודמים והרצה
     await bot.delete_webhook(drop_pending_updates=True)
