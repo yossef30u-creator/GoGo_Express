@@ -50,7 +50,10 @@ class User(Base):
     last_lat = Column(Float, nullable=True)
     last_lng = Column(Float, nullable=True)
     last_seen = Column(DateTime, nullable=True)
-    
+    # וזו השורה החדשה שמאפשרת לנהג לקבוע את המרחק שלו:
+    pref_radius = Column(Integer, default=0, nullable=True)
+
+#==========================================================
 class Job(Base):
     __tablename__ = "jobs"
     id = Column(Integer, primary_key=True, index=True)
